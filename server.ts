@@ -2,12 +2,29 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 const app = express();
 const PORT = 3000;
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Supabase Server Client (Optional, activated if env vars provided)
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '';
+
+let serverSupabase: SupabaseClient | null = null;
+if (SUPABASE_URL && SUPABASE_KEY && !SUPABASE_URL.includes('your-project') && !SUPABASE_KEY.includes('your-anon-key')) {
+  try {
+    serverSupabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+      auth: { persistSession: false },
+    });
+    console.log('[Supabase] Server connected to Supabase database successfully');
+  } catch (err) {
+    console.error('[Supabase] Failed to init server Supabase client:', err);
+  }
+}
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DATA_FILE = path.join(DATA_DIR, 'records.json');
@@ -43,8 +60,46 @@ function writeRecords(records: any[]) {
 }
 
 // 1. GET /api/records - Retrieve all records (with filter, search, sort)
-app.get('/api/records', (req, res) => {
-  let records = readRecords();
+app.get('/api/records', async (req, res) => {
+  let records: any[] = [];
+
+  if (serverSupabase) {
+    try {
+      const { data, error } = await serverSupabase
+        .from('user_records')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (!error && Array.isArray(data)) {
+        records = data.map((row: any) => {
+          const base = row.raw_payload || {};
+          return {
+            id: row.id,
+            createdAt: row.created_at || base.createdAt || new Date().toISOString(),
+            updatedAt: row.updated_at || base.updatedAt || new Date().toISOString(),
+            completionStep: row.completion_step ?? base.completionStep ?? 1,
+            hasCompletedTest: row.has_completed_test ?? base.hasCompletedTest ?? false,
+            hasLeadConsultation: row.has_lead_consultation ?? base.hasLeadConsultation ?? false,
+            leadStatus: row.lead_status ?? base.leadStatus ?? '미신청',
+            adminNotes: row.admin_notes ?? base.adminNotes ?? '',
+            leadInfo: row.lead_info ?? base.leadInfo,
+            selfProfile: row.self_profile ?? base.selfProfile,
+            idealProfile: row.ideal_profile ?? base.idealProfile,
+            explicitWeight: row.explicit_weight ?? base.explicitWeight,
+            implicitWeight: row.implicit_weight ?? base.implicitWeight,
+            summary: row.summary ?? base.summary,
+          };
+        });
+      } else {
+        records = readRecords();
+      }
+    } catch {
+      records = readRecords();
+    }
+  } else {
+    records = readRecords();
+  }
+
 
   const { search, status, gender, region, occupation, sortBy } = req.query as Record<string, string>;
 
@@ -115,7 +170,7 @@ app.get('/api/records/:id', (req, res) => {
 });
 
 // 3. POST /api/records - Create or update a record
-app.post('/api/records', (req, res) => {
+app.post('/api/records', async (req, res) => {
   try {
     const payload = req.body;
     let records = readRecords();
@@ -139,6 +194,31 @@ app.post('/api/records', (req, res) => {
     }
 
     writeRecords(records);
+
+    if (serverSupabase) {
+      try {
+        await serverSupabase.from('user_records').upsert({
+          id: recordId,
+          created_at: updatedRecord.createdAt,
+          updated_at: updatedRecord.updatedAt,
+          completion_step: updatedRecord.completionStep ?? 1,
+          has_completed_test: updatedRecord.hasCompletedTest ?? false,
+          has_lead_consultation: updatedRecord.hasLeadConsultation ?? false,
+          lead_status: updatedRecord.leadStatus || '미신청',
+          admin_notes: updatedRecord.adminNotes || '',
+          lead_info: updatedRecord.leadInfo || null,
+          self_profile: updatedRecord.selfProfile || null,
+          ideal_profile: updatedRecord.idealProfile || null,
+          explicit_weight: updatedRecord.explicitWeight || null,
+          implicit_weight: updatedRecord.implicitWeight || null,
+          summary: updatedRecord.summary || null,
+          raw_payload: updatedRecord,
+        }, { onConflict: 'id' });
+      } catch (e) {
+        console.warn('[Supabase Server Sync Error]', e);
+      }
+    }
+
     res.json({ success: true, record: updatedRecord });
   } catch (err: any) {
     console.error('Error saving record:', err);
@@ -147,7 +227,7 @@ app.post('/api/records', (req, res) => {
 });
 
 // 4. PUT /api/records/:id - Update specific fields (status, admin notes)
-app.put('/api/records/:id', (req, res) => {
+app.put('/api/records/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const updates = req.body;
@@ -165,6 +245,21 @@ app.put('/api/records/:id', (req, res) => {
     };
 
     writeRecords(records);
+
+    if (serverSupabase) {
+      try {
+        const updatePayload: Record<string, any> = { updated_at: new Date().toISOString() };
+        if (updates.leadStatus !== undefined) updatePayload.lead_status = updates.leadStatus;
+        if (updates.adminNotes !== undefined) updatePayload.admin_notes = updates.adminNotes;
+        if (updates.hasLeadConsultation !== undefined) updatePayload.has_lead_consultation = updates.hasLeadConsultation;
+        if (updates.leadInfo !== undefined) updatePayload.lead_info = updates.leadInfo;
+
+        await serverSupabase.from('user_records').update(updatePayload).eq('id', id);
+      } catch (e) {
+        console.warn('[Supabase Server Update Error]', e);
+      }
+    }
+
     res.json({ success: true, record: records[idx] });
   } catch (err: any) {
     console.error('Error updating record:', err);
@@ -173,12 +268,21 @@ app.put('/api/records/:id', (req, res) => {
 });
 
 // 5. DELETE /api/records/:id - Delete single record
-app.delete('/api/records/:id', (req, res) => {
+app.delete('/api/records/:id', async (req, res) => {
   try {
     const { id } = req.params;
     let records = readRecords();
     records = records.filter((r) => r.id !== id);
     writeRecords(records);
+
+    if (serverSupabase) {
+      try {
+        await serverSupabase.from('user_records').delete().eq('id', id);
+      } catch (e) {
+        console.warn('[Supabase Server Delete Error]', e);
+      }
+    }
+
     res.json({ success: true, message: 'Record deleted' });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
@@ -186,14 +290,24 @@ app.delete('/api/records/:id', (req, res) => {
 });
 
 // 6. DELETE /api/records - Clear all records
-app.delete('/api/records', (req, res) => {
+app.delete('/api/records', async (req, res) => {
   try {
     writeRecords([]);
+
+    if (serverSupabase) {
+      try {
+        await serverSupabase.from('user_records').delete().neq('id', '___never___');
+      } catch (e) {
+        console.warn('[Supabase Server Clear Error]', e);
+      }
+    }
+
     res.json({ success: true, message: 'All records cleared' });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
 
 // 7. GET /api/stats - Compute aggregate analytics
 app.get('/api/stats', (req, res) => {

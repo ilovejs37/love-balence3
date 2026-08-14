@@ -14,6 +14,13 @@ import {
   calculateStats,
   exportRecordsToExcel,
 } from '../services/storageService';
+import {
+  getSupabaseConfig,
+  saveCustomSupabaseConfig,
+  testSupabaseConnection,
+  SUPABASE_SQL_SCHEMA,
+  SUPABASE_TABLE_NAME,
+} from '../services/supabaseClient';
 import { DIMENSION_LABELS } from '../data/questionsData';
 import {
   Users,
@@ -45,6 +52,10 @@ import {
   Unlock,
   KeyRound,
   LogOut,
+  Database,
+  Cloud,
+  ExternalLink,
+  Code,
 } from 'lucide-react';
 
 interface AdminDashboardProps {
@@ -74,6 +85,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onClose, onRecor
   const [selectedRecord, setSelectedRecord] = useState<SavedUserRecord | null>(null);
   const [copiedPhone, setCopiedPhone] = useState<string | null>(null);
 
+  // Supabase Database Config Modal & Status State
+  const [showSupabaseModal, setShowSupabaseModal] = useState(false);
+  const [supabaseUrlInput, setSupabaseUrlInput] = useState('');
+  const [supabaseKeyInput, setSupabaseKeyInput] = useState('');
+  const [isTestingSupabase, setIsTestingSupabase] = useState(false);
+  const [supabaseTestResult, setSupabaseTestResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [copiedSql, setCopiedSql] = useState(false);
+  const [isSupabaseConnected, setIsSupabaseConnected] = useState(false);
+
   // Custom Delete Confirm Modal State
   const [recordToDelete, setRecordToDelete] = useState<SavedUserRecord | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -94,9 +114,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onClose, onRecor
   const [editStatus, setEditStatus] = useState<ConsultationStatus>('대기');
   const [savingNotes, setSavingNotes] = useState(false);
 
+  // Check Supabase initial status
+  const checkSupabaseStatus = async () => {
+    const cfg = getSupabaseConfig();
+    if (cfg) {
+      setSupabaseUrlInput(cfg.url);
+      setSupabaseKeyInput(cfg.anonKey);
+      const res = await testSupabaseConnection(cfg);
+      setIsSupabaseConnected(res.success);
+    } else {
+      setIsSupabaseConnected(false);
+    }
+  };
+
   // Load Records if authenticated
   const loadData = async () => {
     setLoading(true);
+    await checkSupabaseStatus();
     const data = await fetchRecords();
     setRecords(data);
     setLoading(false);
@@ -107,6 +141,64 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onClose, onRecor
       loadData();
     }
   }, [isAuthenticated]);
+
+  const handleOpenSupabaseModal = () => {
+    const cfg = getSupabaseConfig();
+    if (cfg) {
+      setSupabaseUrlInput(cfg.url);
+      setSupabaseKeyInput(cfg.anonKey);
+    }
+    setSupabaseTestResult(null);
+    setShowSupabaseModal(true);
+  };
+
+  const handleTestSupabase = async () => {
+    if (!supabaseUrlInput.trim() || !supabaseKeyInput.trim()) {
+      setSupabaseTestResult({ success: false, message: 'URL과 Anon Key를 모두 입력해 주세요.' });
+      return;
+    }
+    setIsTestingSupabase(true);
+    setSupabaseTestResult(null);
+    const res = await testSupabaseConnection({
+      url: supabaseUrlInput.trim(),
+      anonKey: supabaseKeyInput.trim(),
+    });
+    setIsTestingSupabase(false);
+    setSupabaseTestResult(res);
+    if (res.success) {
+      setIsSupabaseConnected(true);
+    }
+  };
+
+  const handleSaveSupabaseConfig = async () => {
+    if (!supabaseUrlInput.trim() || !supabaseKeyInput.trim()) {
+      saveCustomSupabaseConfig(null);
+      setIsSupabaseConnected(false);
+      setShowSupabaseModal(false);
+      setDeleteToast('Supabase 설정이 해제되어 기본 서버/로컬 모드로 전환되었습니다.');
+      setTimeout(() => setDeleteToast(null), 3000);
+      loadData();
+      return;
+    }
+
+    const cfg = { url: supabaseUrlInput.trim(), anonKey: supabaseKeyInput.trim() };
+    saveCustomSupabaseConfig(cfg);
+    setIsTestingSupabase(true);
+    const res = await testSupabaseConnection(cfg);
+    setIsTestingSupabase(false);
+    setIsSupabaseConnected(res.success);
+
+    setShowSupabaseModal(false);
+    setDeleteToast(res.success ? 'Supabase 클라우드 데이터베이스가 연결되었습니다!' : 'Supabase 설정이 저장되었습니다.');
+    setTimeout(() => setDeleteToast(null), 3000);
+    loadData();
+  };
+
+  const handleCopySql = () => {
+    navigator.clipboard.writeText(SUPABASE_SQL_SCHEMA);
+    setCopiedSql(true);
+    setTimeout(() => setCopiedSql(false), 2000);
+  };
 
   const handlePasswordSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -473,6 +565,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onClose, onRecor
         </div>
 
         <div className="flex items-center gap-2.5">
+          {/* Supabase DB Connection Button */}
+          <button
+            onClick={handleOpenSupabaseModal}
+            className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-all cursor-pointer ${
+              isSupabaseConnected
+                ? 'bg-emerald-950/70 hover:bg-emerald-900/80 text-emerald-300 border-emerald-600/50 shadow-xs'
+                : 'bg-indigo-950/70 hover:bg-indigo-900/80 text-indigo-300 border-indigo-600/50'
+            }`}
+            title="다중 단말 통합 Supabase 클라우드 데이터베이스 설정"
+          >
+            <Database className="w-3.5 h-3.5" />
+            <span>{isSupabaseConnected ? '🟢 Supabase DB 연동중' : '🟡 Supabase 클라우드 DB 연동'}</span>
+          </button>
+
           {/* Export to Excel */}
           <button
             onClick={handleExportAll}
@@ -1727,6 +1833,181 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onClose, onRecor
           </div>
         </div>
       )}
+
+      {/* Supabase Cloud DB Setup & SQL Modal */}
+      {showSupabaseModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white rounded-3xl max-w-2xl w-full shadow-2xl overflow-hidden border border-slate-200 animate-in fade-in zoom-in-95 duration-200 my-8">
+            {/* Modal Header */}
+            <div className="bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 px-6 py-5 text-white flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-indigo-600 flex items-center justify-center text-white shadow-md shadow-indigo-900/50">
+                  <Database className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-bold text-base text-white">Supabase 다중 단말 클라우드 DB 연동</h3>
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                      isSupabaseConnected
+                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                        : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                    }`}>
+                      {isSupabaseConnected ? '연결 완료' : '미연동/로컬모드'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-300 mt-0.5">
+                    서로 다른 스마트폰/PC에서 접속한 모든 참여자 데이터를 하나의 DB로 실시간 통합 관리합니다.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowSupabaseModal(false)}
+                className="w-8 h-8 rounded-full bg-slate-800/80 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-6 max-h-[75vh] overflow-y-auto text-slate-800 text-xs">
+              {/* Step 1 & 2 Instructions */}
+              <div className="bg-indigo-50/70 border border-indigo-100 rounded-2xl p-4 space-y-3">
+                <div className="flex items-center gap-2 text-indigo-900 font-bold text-sm">
+                  <Sparkles className="w-4 h-4 text-indigo-600" />
+                  <span>3분 완성! Supabase 테이블 생성 방법</span>
+                </div>
+                <ol className="list-decimal list-inside space-y-1.5 text-slate-700 text-xs leading-relaxed">
+                  <li>
+                    <a
+                      href="https://supabase.com"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-indigo-600 underline font-semibold inline-flex items-center gap-1"
+                    >
+                      Supabase.com <ExternalLink className="w-3 h-3" />
+                    </a>
+                    에서 무료 계정 생성 후 <strong>New Project</strong>를 만듭니다.
+                  </li>
+                  <li>
+                    Supabase 프로젝트 좌측 메뉴에서 <strong>SQL Editor</strong>를 클릭합니다.
+                  </li>
+                  <li>
+                    아래의 <strong>[SQL 스크립트 복사]</strong> 버튼을 누르고 SQL Editor에 붙여넣은 뒤 <strong>[Run]</strong> 버튼을 누릅니다.
+                  </li>
+                  <li>
+                    Supabase <strong>Project Settings ➔ API</strong>에서 <code>Project URL</code>과 <code>anon public key</code>를 복사해 아래에 입력하세요.
+                  </li>
+                </ol>
+              </div>
+
+              {/* SQL Copy Box */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-slate-800 flex items-center gap-1.5 text-xs">
+                    <Code className="w-4 h-4 text-indigo-600" />
+                    테이블 스키마 자동 생성 SQL (user_records 테이블)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleCopySql}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold text-xs transition-colors cursor-pointer shadow-xs"
+                  >
+                    {copiedSql ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copiedSql ? 'SQL 복사 완료!' : 'SQL 스크립트 복사'}</span>
+                  </button>
+                </div>
+                <div className="bg-slate-900 text-slate-200 p-3.5 rounded-xl font-mono text-[11px] max-h-36 overflow-y-auto leading-relaxed border border-slate-800 select-all">
+                  <pre>{SUPABASE_SQL_SCHEMA}</pre>
+                </div>
+              </div>
+
+              {/* Credentials Input */}
+              <div className="space-y-3.5 border-t border-slate-200 pt-4">
+                <h4 className="font-bold text-slate-900 text-sm">Supabase API 키 정보 입력</h4>
+
+                <div>
+                  <label className="block text-slate-700 font-semibold mb-1">
+                    Supabase Project URL
+                  </label>
+                  <input
+                    type="url"
+                    placeholder="https://xyzcompany.supabase.co"
+                    value={supabaseUrlInput}
+                    onChange={(e) => setSupabaseUrlInput(e.target.value)}
+                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded-xl font-mono text-xs focus:ring-2 focus:ring-indigo-500 focus:bg-white transition-all outline-hidden"
+                  />
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    환경 변수(<code>VITE_SUPABASE_URL</code>) 또는 이 입력란에 저장할 수 있습니다.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-slate-700 font-semibold mb-1">
+                    Supabase Anon Public API Key
+                  </label>
+                  <input
+                    type="password"
+                    placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6..."
+                    value={supabaseKeyInput}
+                    onChange={(e) => setSupabaseKeyInput(e.target.value)}
+                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded-xl font-mono text-xs focus:ring-2 focus:ring-indigo-500 focus:bg-white transition-all outline-hidden"
+                  />
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    환경 변수(<code>VITE_SUPABASE_ANON_KEY</code>) 또는 이 입력란에 저장할 수 있습니다.
+                  </p>
+                </div>
+
+                {supabaseTestResult && (
+                  <div
+                    className={`p-3 rounded-xl border flex items-start gap-2 text-xs font-semibold ${
+                      supabaseTestResult.success
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                        : 'bg-rose-50 border-rose-200 text-rose-800'
+                    }`}
+                  >
+                    {supabaseTestResult.success ? (
+                      <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600 mt-0.5" />
+                    ) : (
+                      <AlertCircle className="w-4 h-4 shrink-0 text-rose-600 mt-0.5" />
+                    )}
+                    <span>{supabaseTestResult.message}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Modal Actions */}
+            <div className="p-4 bg-slate-50 border-t border-slate-200 flex items-center justify-between">
+              <button
+                type="button"
+                onClick={handleTestSupabase}
+                disabled={isTestingSupabase}
+                className="px-4 py-2.5 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold rounded-xl text-xs transition-colors cursor-pointer flex items-center gap-1.5"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isTestingSupabase ? 'animate-spin' : ''}`} />
+                <span>{isTestingSupabase ? '연결 테스트 중...' : '연결 상태 테스트'}</span>
+              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowSupabaseModal(false)}
+                  className="px-4 py-2.5 bg-slate-200 hover:bg-slate-300 text-slate-700 font-semibold rounded-xl text-xs transition-colors cursor-pointer"
+                >
+                  취소
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSaveSupabaseConfig}
+                  className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl text-xs transition-all shadow-md shadow-indigo-600/30 cursor-pointer"
+                >
+                  설정 저장 & 동기화
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
+

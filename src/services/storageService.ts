@@ -10,6 +10,12 @@ import {
   LeadConsultation,
   ConsultationStatus,
 } from '../types';
+import {
+  getSupabaseClient,
+  SUPABASE_TABLE_NAME,
+  recordToDbRow,
+  dbRowToRecord,
+} from './supabaseClient';
 
 const LOCAL_STORAGE_KEY = 'love_balance_saved_records_v1';
 const CURRENT_SESSION_KEY = 'love_balance_current_session_id';
@@ -50,7 +56,7 @@ function saveLocalRecords(records: SavedUserRecord[]) {
   }
 }
 
-// 1. Save or update record (Dual persistence: API + LocalStorage)
+// 1. Save or update record (Supabase Cloud DB + Backend API + LocalStorage)
 export async function saveRecord(payload: Partial<SavedUserRecord>): Promise<SavedUserRecord> {
   const sessionId = payload.id || getOrCreateSessionId();
   const recordToSave: SavedUserRecord = {
@@ -71,7 +77,7 @@ export async function saveRecord(payload: Partial<SavedUserRecord>): Promise<Sav
     ...payload,
   };
 
-  // Local storage update
+  // Local storage update for immediate client cache
   const localList = getLocalRecords();
   const existingIdx = localList.findIndex((r) => r.id === sessionId);
   if (existingIdx >= 0) {
@@ -81,7 +87,32 @@ export async function saveRecord(payload: Partial<SavedUserRecord>): Promise<Sav
   }
   saveLocalRecords(localList);
 
-  // Server API update
+  // 1. Primary: Direct Supabase Cloud DB Upsert
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    try {
+      const dbRow = recordToDbRow(recordToSave);
+      const { error } = await supabase
+        .from(SUPABASE_TABLE_NAME)
+        .upsert(dbRow, { onConflict: 'id' });
+
+      if (!error) {
+        // Also trigger server API for background sync
+        fetch('/api/records', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(recordToSave),
+        }).catch(() => {});
+        return recordToSave;
+      } else {
+        console.warn('Supabase upsert warning, fallback to server API:', error.message);
+      }
+    } catch (err) {
+      console.warn('Supabase exception, falling back to server API:', err);
+    }
+  }
+
+  // 2. Secondary: Server API update
   try {
     const res = await fetch('/api/records', {
       method: 'POST',
@@ -101,8 +132,83 @@ export async function saveRecord(payload: Partial<SavedUserRecord>): Promise<Sav
   return recordToSave;
 }
 
-// 2. Fetch all records with filter query
+// 2. Fetch all records with filter query (Supabase Cloud DB -> Backend API -> LocalStorage)
 export async function fetchRecords(filters?: AdminFilterOptions): Promise<SavedUserRecord[]> {
+  // 1. Try Supabase Cloud Database first
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    try {
+      let query = supabase
+        .from(SUPABASE_TABLE_NAME)
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (filters?.status && filters.status !== 'ALL') {
+        if (filters.status === 'LEADS_ONLY') {
+          query = query.eq('has_lead_consultation', true);
+        } else {
+          query = query.eq('lead_status', filters.status);
+        }
+      }
+
+      const { data, error } = await query;
+      if (!error && Array.isArray(data)) {
+        let list = data.map(dbRowToRecord).filter((r) => !r.id.startsWith('rec_sample_'));
+
+        // Client-side sub-filtering
+        if (filters?.searchQuery) {
+          const q = filters.searchQuery.toLowerCase().trim();
+          list = list.filter((r) =>
+            (r.leadInfo?.name || '').toLowerCase().includes(q) ||
+            (r.leadInfo?.phone || '').includes(q) ||
+            (r.selfProfile?.occupationGroup || '').toLowerCase().includes(q) ||
+            (r.selfProfile?.region || '').toLowerCase().includes(q) ||
+            (r.summary?.archetypeTitle || '').toLowerCase().includes(q) ||
+            (r.adminNotes || '').toLowerCase().includes(q)
+          );
+        }
+
+        if (filters?.gender && filters.gender !== '전체') {
+          list = list.filter((r) => r.selfProfile?.gender === filters.gender);
+        }
+        if (filters?.region && filters.region !== '전체') {
+          list = list.filter((r) => r.selfProfile?.region === filters.region);
+        }
+        if (filters?.occupation && filters.occupation !== '전체') {
+          list = list.filter((r) => r.selfProfile?.occupationGroup === filters.occupation);
+        }
+
+        // Sorting
+        if (filters?.sortBy) {
+          list.sort((a, b) => {
+            if (filters.sortBy === 'lead_first') {
+              if (a.hasLeadConsultation && !b.hasLeadConsultation) return -1;
+              if (!a.hasLeadConsultation && b.hasLeadConsultation) return 1;
+              return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+            }
+            if (filters.sortBy === 'oldest') {
+              return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+            }
+            if (filters.sortBy === 'rarity_desc') {
+              return (a.summary?.rarityPercent || 0) - (b.summary?.rarityPercent || 0);
+            }
+            if (filters.sortBy === 'consistency_desc') {
+              return (b.summary?.preferenceConsistency || 0) - (a.summary?.preferenceConsistency || 0);
+            }
+            return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+          });
+        }
+
+        // Synchronize local cache
+        saveLocalRecords(list);
+        return list;
+      }
+    } catch (err) {
+      console.warn('Supabase fetch failed, falling back to server API:', err);
+    }
+  }
+
+  // 2. Secondary: Server API
   try {
     const params = new URLSearchParams();
     if (filters?.searchQuery) params.append('search', filters.searchQuery);
@@ -126,7 +232,7 @@ export async function fetchRecords(filters?: AdminFilterOptions): Promise<SavedU
     console.warn('Failed to fetch from server, fallback to local storage:', err);
   }
 
-  // Fallback to local storage with manual filter
+  // 3. Fallback to local storage with manual filter
   let list = getLocalRecords();
   if (filters?.searchQuery) {
     const q = filters.searchQuery.toLowerCase();
@@ -134,7 +240,8 @@ export async function fetchRecords(filters?: AdminFilterOptions): Promise<SavedU
       (r.leadInfo?.name || '').toLowerCase().includes(q) ||
       (r.leadInfo?.phone || '').includes(q) ||
       (r.selfProfile?.occupationGroup || '').toLowerCase().includes(q) ||
-      (r.selfProfile?.region || '').toLowerCase().includes(q)
+      (r.selfProfile?.region || '').toLowerCase().includes(q) ||
+      (r.adminNotes || '').toLowerCase().includes(q)
     );
   }
   return list;
@@ -153,6 +260,34 @@ export async function updateRecordDetails(
     saveLocalRecords(localList);
   }
 
+  // Supabase update
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    try {
+      const updatePayload: Record<string, any> = {
+        updated_at: new Date().toISOString(),
+      };
+      if (updates.leadStatus !== undefined) updatePayload.lead_status = updates.leadStatus;
+      if (updates.adminNotes !== undefined) updatePayload.admin_notes = updates.adminNotes;
+      if (updates.hasLeadConsultation !== undefined) updatePayload.has_lead_consultation = updates.hasLeadConsultation;
+      if (updates.leadInfo !== undefined) updatePayload.lead_info = updates.leadInfo;
+
+      const { data, error } = await supabase
+        .from(SUPABASE_TABLE_NAME)
+        .update(updatePayload)
+        .eq('id', id)
+        .select()
+        .single();
+
+      if (!error && data) {
+        return dbRowToRecord(data);
+      }
+    } catch (err) {
+      console.warn('Supabase update failed, fallback to server API:', err);
+    }
+  }
+
+  // Server API fallback
   try {
     const res = await fetch(`/api/records/${id}`, {
       method: 'PUT',
@@ -175,6 +310,15 @@ export async function deleteRecord(id: string): Promise<boolean> {
   const localList = getLocalRecords().filter((r) => r.id !== id);
   saveLocalRecords(localList);
 
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    try {
+      await supabase.from(SUPABASE_TABLE_NAME).delete().eq('id', id);
+    } catch (err) {
+      console.warn('Supabase delete error:', err);
+    }
+  }
+
   try {
     const res = await fetch(`/api/records/${id}`, { method: 'DELETE' });
     return res.ok;
@@ -186,6 +330,16 @@ export async function deleteRecord(id: string): Promise<boolean> {
 // 5. Clear all records
 export async function clearAllRecords(): Promise<boolean> {
   saveLocalRecords([]);
+
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    try {
+      await supabase.from(SUPABASE_TABLE_NAME).delete().neq('id', '___never_match___');
+    } catch (err) {
+      console.warn('Supabase clear error:', err);
+    }
+  }
+
   try {
     const res = await fetch('/api/records', { method: 'DELETE' });
     return res.ok;
@@ -193,6 +347,7 @@ export async function clearAllRecords(): Promise<boolean> {
     return true;
   }
 }
+
 
 // 6. Calculate Admin Statistics
 export function calculateStats(records: SavedUserRecord[]): AdminStats {

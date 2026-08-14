@@ -12,26 +12,32 @@ import {
 } from '../types';
 import {
   getSupabaseClient,
-  SUPABASE_TABLE_NAME,
-  recordToDbRow,
-  dbRowToRecord,
+  TABLE_TEST_SUBMISSIONS,
+  TABLE_CONSULTATIONS,
+  generateUUID,
+  ensureValidUUID,
+  mapStatusToDb,
+  mapStatusFromDb,
+  recordToSubmissionRow,
+  recordToConsultationRow,
+  mergeDbRowsToRecord,
 } from './supabaseClient';
 
 const LOCAL_STORAGE_KEY = 'love_balance_saved_records_v1';
 const CURRENT_SESSION_KEY = 'love_balance_current_session_id';
 
-// Helper to get or create unique session ID
+// Helper to get or create unique session ID in valid UUID format
 export function getOrCreateSessionId(): string {
   let id = localStorage.getItem(CURRENT_SESSION_KEY);
-  if (!id) {
-    id = `rec_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  if (!id || !id.includes('-')) {
+    id = generateUUID();
     localStorage.setItem(CURRENT_SESSION_KEY, id);
   }
   return id;
 }
 
 export function resetSessionId(): string {
-  const newId = `rec_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  const newId = generateUUID();
   localStorage.setItem(CURRENT_SESSION_KEY, newId);
   return newId;
 }
@@ -56,9 +62,9 @@ function saveLocalRecords(records: SavedUserRecord[]) {
   }
 }
 
-// 1. Save or update record (Supabase Cloud DB + Backend API + LocalStorage)
+// 1. Save or update record (Supabase test_submissions + consultations + Backend API + LocalStorage)
 export async function saveRecord(payload: Partial<SavedUserRecord>): Promise<SavedUserRecord> {
-  const sessionId = payload.id || getOrCreateSessionId();
+  const sessionId = ensureValidUUID(payload.id || getOrCreateSessionId());
   const recordToSave: SavedUserRecord = {
     id: sessionId,
     createdAt: payload.createdAt || new Date().toISOString(),
@@ -91,22 +97,47 @@ export async function saveRecord(payload: Partial<SavedUserRecord>): Promise<Sav
   const supabase = getSupabaseClient();
   if (supabase) {
     try {
-      const dbRow = recordToDbRow(recordToSave);
-      const { error } = await supabase
-        .from(SUPABASE_TABLE_NAME)
-        .upsert(dbRow, { onConflict: 'id' });
-
-      if (!error) {
-        // Also trigger server API for background sync
-        fetch('/api/records', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(recordToSave),
-        }).catch(() => {});
-        return recordToSave;
-      } else {
-        console.warn('Supabase upsert warning, fallback to server API:', error.message);
+      // 1-A. Upsert test_submissions if user has at least selfProfile or summary
+      if (recordToSave.selfProfile || recordToSave.summary || recordToSave.hasCompletedTest) {
+        const subRow = recordToSubmissionRow(recordToSave);
+        const { error: subErr } = await supabase
+          .from(TABLE_TEST_SUBMISSIONS)
+          .upsert(subRow, { onConflict: 'id' });
+        if (subErr) {
+          console.warn('Supabase test_submissions upsert error:', subErr.message);
+        }
       }
+
+      // 1-B. Upsert consultations if consultation info exists
+      if (recordToSave.hasLeadConsultation || recordToSave.leadInfo) {
+        const consRow = recordToConsultationRow(recordToSave);
+        // Check if consultation exists by submission_id
+        const { data: existingCons } = await supabase
+          .from(TABLE_CONSULTATIONS)
+          .select('id')
+          .eq('submission_id', sessionId)
+          .maybeSingle();
+
+        if (existingCons && existingCons.id) {
+          await supabase
+            .from(TABLE_CONSULTATIONS)
+            .update(consRow)
+            .eq('id', existingCons.id);
+        } else {
+          await supabase
+            .from(TABLE_CONSULTATIONS)
+            .insert(consRow);
+        }
+      }
+
+      // Also trigger server API for background sync
+      fetch('/api/records', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(recordToSave),
+      }).catch(() => {});
+
+      return recordToSave;
     } catch (err) {
       console.warn('Supabase exception, falling back to server API:', err);
     }
@@ -132,28 +163,53 @@ export async function saveRecord(payload: Partial<SavedUserRecord>): Promise<Sav
   return recordToSave;
 }
 
-// 2. Fetch all records with filter query (Supabase Cloud DB -> Backend API -> LocalStorage)
+// 2. Fetch all records with filter query (Supabase test_submissions + consultations -> Backend API -> LocalStorage)
 export async function fetchRecords(filters?: AdminFilterOptions): Promise<SavedUserRecord[]> {
   // 1. Try Supabase Cloud Database first
   const supabase = getSupabaseClient();
   if (supabase) {
     try {
-      let query = supabase
-        .from(SUPABASE_TABLE_NAME)
-        .select('*')
-        .order('created_at', { ascending: false });
+      const [subsRes, consRes] = await Promise.all([
+        supabase.from(TABLE_TEST_SUBMISSIONS).select('*').order('created_at', { ascending: false }),
+        supabase.from(TABLE_CONSULTATIONS).select('*').order('created_at', { ascending: false }),
+      ]);
 
-      if (filters?.status && filters.status !== 'ALL') {
-        if (filters.status === 'LEADS_ONLY') {
-          query = query.eq('has_lead_consultation', true);
-        } else {
-          query = query.eq('lead_status', filters.status);
+      if (!subsRes.error && Array.isArray(subsRes.data)) {
+        const submissions = subsRes.data;
+        const consultations = (!consRes.error && Array.isArray(consRes.data)) ? consRes.data : [];
+
+        // Build consultation lookup map by submission_id
+        const consMap = new Map<string, any>();
+        const matchedConsIds = new Set<string>();
+
+        for (const c of consultations) {
+          if (c.submission_id) {
+            consMap.set(c.submission_id, c);
+            matchedConsIds.add(c.id);
+          }
         }
-      }
 
-      const { data, error } = await query;
-      if (!error && Array.isArray(data)) {
-        let list = data.map(dbRowToRecord).filter((r) => !r.id.startsWith('rec_sample_'));
+        // Merge submissions with consultations
+        let list: SavedUserRecord[] = submissions.map((sub: any) => {
+          const matchedCons = consMap.get(sub.id);
+          return mergeDbRowsToRecord(sub, matchedCons);
+        });
+
+        // Add standalone consultations if any
+        for (const c of consultations) {
+          if (!matchedConsIds.has(c.id) && !consMap.has(c.submission_id)) {
+            list.push(mergeDbRowsToRecord(null, c));
+          }
+        }
+
+        // Apply Status Filter
+        if (filters?.status && filters.status !== 'ALL') {
+          if (filters.status === 'LEADS_ONLY') {
+            list = list.filter((r) => r.hasLeadConsultation);
+          } else {
+            list = list.filter((r) => r.leadStatus === filters.status);
+          }
+        }
 
         // Client-side sub-filtering
         if (filters?.searchQuery) {
@@ -247,14 +303,16 @@ export async function fetchRecords(filters?: AdminFilterOptions): Promise<SavedU
   return list;
 }
 
-// 3. Update single record (Status, Admin Notes)
+// 3. Update single record (Status, Admin Notes in consultations table)
 export async function updateRecordDetails(
   id: string,
   updates: Partial<SavedUserRecord>
 ): Promise<SavedUserRecord | null> {
+  const validId = ensureValidUUID(id);
+
   // Local storage update
   const localList = getLocalRecords();
-  const idx = localList.findIndex((r) => r.id === id);
+  const idx = localList.findIndex((r) => r.id === id || r.id === validId);
   if (idx >= 0) {
     localList[idx] = { ...localList[idx], ...updates, updatedAt: new Date().toISOString() };
     saveLocalRecords(localList);
@@ -267,20 +325,35 @@ export async function updateRecordDetails(
       const updatePayload: Record<string, any> = {
         updated_at: new Date().toISOString(),
       };
-      if (updates.leadStatus !== undefined) updatePayload.lead_status = updates.leadStatus;
+      if (updates.leadStatus !== undefined) updatePayload.status = mapStatusToDb(updates.leadStatus);
       if (updates.adminNotes !== undefined) updatePayload.admin_notes = updates.adminNotes;
-      if (updates.hasLeadConsultation !== undefined) updatePayload.has_lead_consultation = updates.hasLeadConsultation;
-      if (updates.leadInfo !== undefined) updatePayload.lead_info = updates.leadInfo;
+      if (updates.leadInfo?.name) updatePayload.name = updates.leadInfo.name;
+      if (updates.leadInfo?.phone) updatePayload.phone = updates.leadInfo.phone;
+      if (updates.leadInfo?.preferredTime) updatePayload.preferred_time = updates.leadInfo.preferredTime;
 
-      const { data, error } = await supabase
-        .from(SUPABASE_TABLE_NAME)
-        .update(updatePayload)
-        .eq('id', id)
-        .select()
-        .single();
+      // Update consultation record by submission_id
+      const { data: existingCons } = await supabase
+        .from(TABLE_CONSULTATIONS)
+        .select('id')
+        .eq('submission_id', validId)
+        .maybeSingle();
 
-      if (!error && data) {
-        return dbRowToRecord(data);
+      if (existingCons && existingCons.id) {
+        await supabase
+          .from(TABLE_CONSULTATIONS)
+          .update(updatePayload)
+          .eq('id', existingCons.id);
+      } else {
+        // Create consultation if it didn't exist
+        await supabase.from(TABLE_CONSULTATIONS).insert({
+          submission_id: validId,
+          name: updates.leadInfo?.name || '고객',
+          phone: updates.leadInfo?.phone || '010-0000-0000',
+          preferred_time: updates.leadInfo?.preferredTime || '상담 요청',
+          consent: true,
+          status: mapStatusToDb(updates.leadStatus || '대기'),
+          admin_notes: updates.adminNotes || '',
+        });
       }
     } catch (err) {
       console.warn('Supabase update failed, fallback to server API:', err);
@@ -305,15 +378,19 @@ export async function updateRecordDetails(
   return idx >= 0 ? localList[idx] : null;
 }
 
-// 4. Delete record
+// 4. Delete record from both test_submissions and consultations
 export async function deleteRecord(id: string): Promise<boolean> {
-  const localList = getLocalRecords().filter((r) => r.id !== id);
+  const validId = ensureValidUUID(id);
+  const localList = getLocalRecords().filter((r) => r.id !== id && r.id !== validId);
   saveLocalRecords(localList);
 
   const supabase = getSupabaseClient();
   if (supabase) {
     try {
-      await supabase.from(SUPABASE_TABLE_NAME).delete().eq('id', id);
+      await Promise.all([
+        supabase.from(TABLE_CONSULTATIONS).delete().eq('submission_id', validId),
+        supabase.from(TABLE_TEST_SUBMISSIONS).delete().eq('id', validId),
+      ]);
     } catch (err) {
       console.warn('Supabase delete error:', err);
     }
@@ -334,7 +411,10 @@ export async function clearAllRecords(): Promise<boolean> {
   const supabase = getSupabaseClient();
   if (supabase) {
     try {
-      await supabase.from(SUPABASE_TABLE_NAME).delete().neq('id', '___never_match___');
+      await Promise.all([
+        supabase.from(TABLE_CONSULTATIONS).delete().neq('id', '00000000-0000-0000-0000-000000000000'),
+        supabase.from(TABLE_TEST_SUBMISSIONS).delete().neq('id', '00000000-0000-0000-0000-000000000000'),
+      ]);
     } catch (err) {
       console.warn('Supabase clear error:', err);
     }
@@ -347,6 +427,7 @@ export async function clearAllRecords(): Promise<boolean> {
     return true;
   }
 }
+
 
 
 // 6. Calculate Admin Statistics

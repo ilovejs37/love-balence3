@@ -220,23 +220,92 @@ app.post('/api/records', async (req, res) => {
 
     if (serverSupabase) {
       try {
-        await serverSupabase.from('user_records').upsert({
-          id: recordId,
-          created_at: updatedRecord.createdAt,
-          updated_at: updatedRecord.updatedAt,
-          completion_step: updatedRecord.completionStep ?? 1,
-          has_completed_test: updatedRecord.hasCompletedTest ?? false,
-          has_lead_consultation: updatedRecord.hasLeadConsultation ?? false,
-          lead_status: updatedRecord.leadStatus || '미신청',
-          admin_notes: updatedRecord.adminNotes || '',
-          lead_info: updatedRecord.leadInfo || null,
-          self_profile: updatedRecord.selfProfile || null,
-          ideal_profile: updatedRecord.idealProfile || null,
-          explicit_weight: updatedRecord.explicitWeight || null,
-          implicit_weight: updatedRecord.implicitWeight || null,
-          summary: updatedRecord.summary || null,
-          raw_payload: updatedRecord,
-        }, { onConflict: 'id' });
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        const validId = uuidRegex.test(recordId) ? recordId : '00000000-0000-0000-0000-' + recordId.replace(/[^0-9a-f]/gi, '').padEnd(12, '0').slice(-12);
+
+        // 1. Sync to test_submissions
+        if (updatedRecord.selfProfile || updatedRecord.summary || updatedRecord.hasCompletedTest) {
+          const self = updatedRecord.selfProfile || {};
+          const ideal = updatedRecord.idealProfile || {};
+          const exp = updatedRecord.explicitWeight || {};
+          const imp = updatedRecord.implicitWeight || {};
+          const sum = updatedRecord.summary || {};
+
+          const finalWeights: Record<string, number> = {};
+          const dimensions = ['appearance', 'personality', 'communication', 'career', 'economics', 'age', 'lifestyle', 'family', 'hobbies', 'marriageValues'];
+          for (const d of dimensions) {
+            const e = (exp as any)[d] ?? 10;
+            const i = (imp as any)[d] ?? 10;
+            finalWeights[d] = Math.round((e + i) / 2);
+          }
+
+          await serverSupabase.from('test_submissions').upsert({
+            id: validId,
+            created_at: updatedRecord.createdAt,
+            age: Number(self.age) || 28,
+            gender: (self.gender === '여성' ? '여성' : '남성'),
+            region: self.region || '서울',
+            height: Number(self.height) || (self.gender === '여성' ? 163 : 177),
+            occupation_group: self.occupationGroup || '기타',
+            self_profile: self,
+            ideal_profile: ideal,
+            explicit_weights: exp,
+            implicit_weights: imp,
+            final_weights: finalWeights,
+            archetype_code: sum.archetypeCode || 'BALANCE_EXPLORER',
+            archetype_title: sum.archetypeTitle || '균형잡힌 가치관 탐색가',
+            consistency_percent: Number(sum.preferenceConsistency) || 85.0,
+            rarity_percent: Number(sum.rarityPercent) || 7.5,
+            full_report: {
+              summary: sum,
+              completionStep: updatedRecord.completionStep ?? 6,
+              hasCompletedTest: updatedRecord.hasCompletedTest ?? true,
+            },
+          }, { onConflict: 'id' });
+        }
+
+        // 2. Sync to consultations
+        if (updatedRecord.hasLeadConsultation || updatedRecord.leadInfo) {
+          const lead = updatedRecord.leadInfo || {};
+          const statusMap: Record<string, string> = {
+            '대기': 'pending',
+            '미신청': 'pending',
+            '상담예약': 'contacted',
+            '연락완료': 'contacted',
+            '상담완료': 'completed',
+            '보류': 'cancelled',
+            '취소': 'cancelled',
+          };
+          const dbStatus = statusMap[updatedRecord.leadStatus || '대기'] || 'pending';
+
+          const { data: existingCons } = await serverSupabase
+            .from('consultations')
+            .select('id')
+            .eq('submission_id', validId)
+            .maybeSingle();
+
+          const consData = {
+            submission_id: validId,
+            name: lead.name || '미등록',
+            phone: lead.phone || '010-0000-0000',
+            preferred_time: lead.preferredTime || '무관 (빠른 상담)',
+            consent: lead.consent !== false,
+            status: dbStatus,
+            manager_payload: {
+              selfProfile: updatedRecord.selfProfile,
+              idealProfile: updatedRecord.idealProfile,
+              summary: updatedRecord.summary,
+              adminNotes: updatedRecord.adminNotes,
+            },
+            admin_notes: updatedRecord.adminNotes || '',
+          };
+
+          if (existingCons && existingCons.id) {
+            await serverSupabase.from('consultations').update(consData).eq('id', existingCons.id);
+          } else {
+            await serverSupabase.from('consultations').insert(consData);
+          }
+        }
       } catch (e) {
         console.warn('[Supabase Server Sync Error]', e);
       }
@@ -271,13 +340,30 @@ app.put('/api/records/:id', async (req, res) => {
 
     if (serverSupabase) {
       try {
-        const updatePayload: Record<string, any> = { updated_at: new Date().toISOString() };
-        if (updates.leadStatus !== undefined) updatePayload.lead_status = updates.leadStatus;
-        if (updates.adminNotes !== undefined) updatePayload.admin_notes = updates.adminNotes;
-        if (updates.hasLeadConsultation !== undefined) updatePayload.has_lead_consultation = updates.hasLeadConsultation;
-        if (updates.leadInfo !== undefined) updatePayload.lead_info = updates.leadInfo;
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        const validId = uuidRegex.test(id) ? id : '00000000-0000-0000-0000-' + id.replace(/[^0-9a-f]/gi, '').padEnd(12, '0').slice(-12);
 
-        await serverSupabase.from('user_records').update(updatePayload).eq('id', id);
+        const statusMap: Record<string, string> = {
+          '대기': 'pending',
+          '미신청': 'pending',
+          '상담예약': 'contacted',
+          '연락완료': 'contacted',
+          '상담완료': 'completed',
+          '보류': 'cancelled',
+          '취소': 'cancelled',
+        };
+
+        const consUpdate: Record<string, any> = { updated_at: new Date().toISOString() };
+        if (updates.leadStatus !== undefined) consUpdate.status = statusMap[updates.leadStatus] || 'pending';
+        if (updates.adminNotes !== undefined) consUpdate.admin_notes = updates.adminNotes;
+        if (updates.leadInfo?.name) consUpdate.name = updates.leadInfo.name;
+        if (updates.leadInfo?.phone) consUpdate.phone = updates.leadInfo.phone;
+        if (updates.leadInfo?.preferredTime) consUpdate.preferred_time = updates.leadInfo.preferredTime;
+
+        const { data: existingCons } = await serverSupabase.from('consultations').select('id').eq('submission_id', validId).maybeSingle();
+        if (existingCons && existingCons.id) {
+          await serverSupabase.from('consultations').update(consUpdate).eq('id', existingCons.id);
+        }
       } catch (e) {
         console.warn('[Supabase Server Update Error]', e);
       }
@@ -300,7 +386,13 @@ app.delete('/api/records/:id', async (req, res) => {
 
     if (serverSupabase) {
       try {
-        await serverSupabase.from('user_records').delete().eq('id', id);
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        const validId = uuidRegex.test(id) ? id : '00000000-0000-0000-0000-' + id.replace(/[^0-9a-f]/gi, '').padEnd(12, '0').slice(-12);
+
+        await Promise.all([
+          serverSupabase.from('consultations').delete().eq('submission_id', validId),
+          serverSupabase.from('test_submissions').delete().eq('id', validId),
+        ]);
       } catch (e) {
         console.warn('[Supabase Server Delete Error]', e);
       }
@@ -319,7 +411,10 @@ app.delete('/api/records', async (req, res) => {
 
     if (serverSupabase) {
       try {
-        await serverSupabase.from('user_records').delete().neq('id', '___never___');
+        await Promise.all([
+          serverSupabase.from('consultations').delete().neq('id', '00000000-0000-0000-0000-000000000000'),
+          serverSupabase.from('test_submissions').delete().neq('id', '00000000-0000-0000-0000-000000000000'),
+        ]);
       } catch (e) {
         console.warn('[Supabase Server Clear Error]', e);
       }

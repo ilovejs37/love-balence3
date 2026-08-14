@@ -19,7 +19,8 @@ import {
   saveCustomSupabaseConfig,
   testSupabaseConnection,
   SUPABASE_SQL_SCHEMA,
-  SUPABASE_TABLE_NAME,
+  TABLE_TEST_SUBMISSIONS,
+  TABLE_CONSULTATIONS,
 } from '../services/supabaseClient';
 import { DIMENSION_LABELS } from '../data/questionsData';
 import {
@@ -1904,7 +1905,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onClose, onRecor
                 <div className="flex items-center justify-between">
                   <span className="font-bold text-slate-800 flex items-center gap-1.5 text-xs">
                     <Code className="w-4 h-4 text-indigo-600" />
-                    테이블 스키마 자동 생성 SQL (user_records 테이블)
+                    테이블 스키마 자동 생성 SQL (test_submissions 및 consultations 테이블)
                   </span>
                   <button
                     type="button"

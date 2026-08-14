@@ -1,0 +1,8 @@
+{
+  "name": "LOVE BALANCE3",
+  "description": "6단계 AI 알고리즘으로 명시적 이상형과 행동 데이터 기반 쌍방 매칭율, 이상형 희소도를 분석하는 매칭 시뮬레이터",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

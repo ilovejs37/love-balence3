@@ -54,9 +54,30 @@ CREATE POLICY "Allow anonymous update" ON public.user_records FOR UPDATE USING (
 CREATE POLICY "Allow anonymous delete" ON public.user_records FOR DELETE USING (true);
 `;
 
+// Memory cache for runtime synced config
+let runtimeSyncedConfig: SupabaseConfig | null = null;
+
+// Auto-sync config from server API once on app load
+if (typeof window !== 'undefined') {
+  fetch('/api/supabase-config')
+    .then((res) => res.json())
+    .then((data) => {
+      if (data.success && data.config && data.config.url && data.config.anonKey) {
+        runtimeSyncedConfig = data.config;
+        localStorage.setItem(SUPABASE_STORAGE_CONFIG_KEY, JSON.stringify(data.config));
+      }
+    })
+    .catch(() => {});
+}
+
 // Helper to get active Supabase credentials
 export function getSupabaseConfig(): SupabaseConfig | null {
-  // 1. Check Vite Environment Variables
+  // 1. Check runtime synced config in memory
+  if (runtimeSyncedConfig && runtimeSyncedConfig.url && runtimeSyncedConfig.anonKey) {
+    return runtimeSyncedConfig;
+  }
+
+  // 2. Check Vite Environment Variables
   const metaEnv = (import.meta as any).env || {};
   const envUrl = metaEnv.VITE_SUPABASE_URL || '';
   const envKey = metaEnv.VITE_SUPABASE_ANON_KEY || '';
@@ -65,7 +86,7 @@ export function getSupabaseConfig(): SupabaseConfig | null {
     return { url: envUrl.trim(), anonKey: envKey.trim() };
   }
 
-  // 2. Check Custom LocalStorage Config set by Admin
+  // 3. Check Custom LocalStorage Config
   try {
     const custom = localStorage.getItem(SUPABASE_STORAGE_CONFIG_KEY);
     if (custom) {
@@ -83,9 +104,23 @@ export function getSupabaseConfig(): SupabaseConfig | null {
 
 export function saveCustomSupabaseConfig(config: SupabaseConfig | null) {
   if (!config || !config.url || !config.anonKey) {
+    runtimeSyncedConfig = null;
     localStorage.removeItem(SUPABASE_STORAGE_CONFIG_KEY);
+    // Broadcast clear to server
+    fetch('/api/supabase-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: '', anonKey: '' }),
+    }).catch(() => {});
   } else {
-    localStorage.setItem(SUPABASE_STORAGE_CONFIG_KEY, JSON.stringify(config));
+    runtimeSyncedConfig = { url: config.url.trim(), anonKey: config.anonKey.trim() };
+    localStorage.setItem(SUPABASE_STORAGE_CONFIG_KEY, JSON.stringify(runtimeSyncedConfig));
+    // Broadcast to server to persist for all devices
+    fetch('/api/supabase-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(runtimeSyncedConfig),
+    }).catch(() => {});
   }
 }
 

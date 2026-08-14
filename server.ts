@@ -15,19 +15,42 @@ const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL |
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '';
 
 let serverSupabase: SupabaseClient | null = null;
-if (SUPABASE_URL && SUPABASE_KEY && !SUPABASE_URL.includes('your-project') && !SUPABASE_KEY.includes('your-anon-key')) {
-  try {
-    serverSupabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-      auth: { persistSession: false },
-    });
-    console.log('[Supabase] Server connected to Supabase database successfully');
-  } catch (err) {
-    console.error('[Supabase] Failed to init server Supabase client:', err);
+let activeSupabaseConfig = {
+  url: SUPABASE_URL,
+  anonKey: SUPABASE_KEY,
+};
+
+function initSupabaseClient(url: string, key: string) {
+  if (url && key && !url.includes('your-project') && !key.includes('your-anon-key')) {
+    try {
+      serverSupabase = createClient(url, key, {
+        auth: { persistSession: false },
+      });
+      activeSupabaseConfig = { url, anonKey: key };
+      console.log('[Supabase] Server connected to Supabase database successfully:', url);
+    } catch (err) {
+      console.error('[Supabase] Failed to init server Supabase client:', err);
+    }
   }
 }
 
+initSupabaseClient(SUPABASE_URL, SUPABASE_KEY);
+
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DATA_FILE = path.join(DATA_DIR, 'records.json');
+const SUPABASE_CONFIG_FILE = path.join(DATA_DIR, 'supabase_config.json');
+
+// Read persisted server supabase config if present
+try {
+  if (fs.existsSync(SUPABASE_CONFIG_FILE)) {
+    const persisted = JSON.parse(fs.readFileSync(SUPABASE_CONFIG_FILE, 'utf-8'));
+    if (persisted.url && persisted.anonKey) {
+      initSupabaseClient(persisted.url, persisted.anonKey);
+    }
+  }
+} catch (e) {
+  console.warn('Failed to load persisted supabase config:', e);
+}
 
 // Ensure data directory and file exist
 function ensureDataFile() {
@@ -361,6 +384,35 @@ app.get('/api/stats', (req, res) => {
       pendingLeadsCount,
     }
   });
+});
+
+// 8. GET & POST /api/supabase-config - Broadcast Supabase credentials to all clients
+app.get('/api/supabase-config', (req, res) => {
+  res.json({
+    success: true,
+    config: activeSupabaseConfig.url && activeSupabaseConfig.anonKey ? activeSupabaseConfig : null,
+    isConnected: !!serverSupabase,
+  });
+});
+
+app.post('/api/supabase-config', (req, res) => {
+  try {
+    const { url, anonKey } = req.body;
+    ensureDataFile();
+    if (url && anonKey) {
+      fs.writeFileSync(SUPABASE_CONFIG_FILE, JSON.stringify({ url: url.trim(), anonKey: anonKey.trim() }, null, 2), 'utf-8');
+      initSupabaseClient(url.trim(), anonKey.trim());
+    } else {
+      if (fs.existsSync(SUPABASE_CONFIG_FILE)) {
+        fs.unlinkSync(SUPABASE_CONFIG_FILE);
+      }
+      serverSupabase = null;
+      activeSupabaseConfig = { url: '', anonKey: '' };
+    }
+    res.json({ success: true, config: activeSupabaseConfig, isConnected: !!serverSupabase });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 // Vite middleware & Static server setup
